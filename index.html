@@ -66,7 +66,7 @@ details summary{cursor:pointer;font-weight:600;color:var(--pri2)}
 <div id="app"></div>
 <div id="modal"><div class="sheet" id="sheet"></div></div>
 <div id="toast"></div>
-<script src="https://cdn.jsdelivr.net/npm/microsoft-cognitiveservices-speech-sdk@1.53.0/distrib/browser/microsoft.cognitiveservices.speech.sdk.bundle-min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/microsoft-cognitiveservices-speech-sdk@1.53.0/distrib/browser/microsoft.cognitiveservices.speech.sdk.bundle-min.js" integrity="sha384-YG0CfpDhvvBF6YvDNHgeAPtRBdnkEnbLtXyPhAfT+dB7uCoCZgcIruOnhmQhJQqv" crossorigin="anonymous"></script>
 <script>
 "use strict";
 /* =========================================================
@@ -201,7 +201,7 @@ const AZ_FREE_SEC = 5*3600, AZ_RESERVE_SEC = 30*60, TTS_FREE = 480000;
 /* ---------------- Lưu trữ ---------------- */
 const KEY = "speakhr.v1";
 function defaults(){return{
-  settings:{azureKey:"",azureRegion:"southeastasia",geminiKey:"",liteModels:[],flashModels:[],convoPron:true,prosody:true},
+  settings:{azureKey:"",azureRegion:"southeastasia",geminiKey:"",liteModels:[],flashModels:[],convoPron:true,prosody:true,ghToken:"",gistId:"",lastBackup:""},
   profile:{stage:1,stageSince:null,lessonIdx:{1:0,2:0,3:0},soundIdx:0,created:new Date().toISOString()},
   phrases:[],sessions:[],phon:{},errors:[],reports:{},usage:{month:"",azureSec:0,ttsChars:0},current:null
 };}
@@ -357,6 +357,41 @@ const Gem={base:"https://generativelanguage.googleapis.com/v1beta",
     const txt=((j.candidates&&j.candidates[0]&&j.candidates[0].content&&j.candidates[0].content.parts)||[]).filter(p=>!p.thought&&p.text).map(p=>p.text).join("");
     if(!txt){const e=new Error("Gemini không trả lời.");e.status=500;throw e;}return parseJSON(txt);}
 };
+
+
+/* ---------------- Sao lưu tự động lên GitHub Gist (bí mật) ---------------- */
+const Cloud={api:"https://api.github.com",FILE:"speakhr-backup.json",DESC:"SpeakHR backup (tự động)",
+  ok(){return !!(S.settings.ghToken&&S.settings.ghToken.trim());},
+  async req(path,opt){opt=opt||{};const headers={"Authorization":"Bearer "+S.settings.ghToken.trim(),"Accept":"application/vnd.github+json"};if(opt.body)headers["Content-Type"]="application/json";
+    const r=await fetch(this.api+path,Object.assign({},opt,{headers}));
+    if(r.status===401)throw new Error("GitHub token sai hoặc đã hết hạn.");
+    if(!r.ok){let m="";try{m=(await r.json()).message;}catch(e){}const e=new Error(r.status===403||r.status===404&&path.startsWith("/gists?")?"Token chưa có quyền 'gist'.":"GitHub: "+(m||r.status));e.status=r.status;throw e;}
+    return r.status===204?null:r.json();},
+  async findGist(){if(S.settings.gistId)return S.settings.gistId;
+    for(let page=1;page<=5;page++){const list=await this.req(`/gists?per_page=100&page=${page}`);const g=list.find(x=>x.files&&x.files[this.FILE]);
+      if(g){S.settings.gistId=g.id;save();return g.id;}if(list.length<100)break;}return null;},
+  async read(id){const g=await this.req("/gists/"+id);const f=g.files&&g.files[this.FILE];if(!f)return null;let txt=f.content;
+    if(f.truncated||!txt){const r=await fetch(f.raw_url);txt=await r.text();}return JSON.parse(txt);},
+  payload(){const d=JSON.parse(JSON.stringify(S));Object.assign(d.settings,{azureKey:"",geminiKey:"",ghToken:"",gistId:"",lastBackup:""});d.backupAt=new Date().toISOString();return JSON.stringify(d);},
+  async backup(){if(!this.ok())return;let id=await this.findGist();
+    if(id&&!S.settings.lastBackup){const cloud=await this.read(id).catch(()=>null);
+      if(cloud&&Array.isArray(cloud.sessions)&&cloud.sessions.length>S.sessions.length){R.flags.cloudNewer=cloud.sessions.length;const e=new Error("Trên GitHub có bản sao lưu nhiều dữ liệu hơn ("+cloud.sessions.length+" buổi). Hãy bấm 'Khôi phục từ GitHub' trước.");e.cloudNewer=true;throw e;}}
+    const content=this.payload();
+    if(id){try{await this.req("/gists/"+id,{method:"PATCH",body:JSON.stringify({description:this.DESC,files:{[this.FILE]:{content}}})});}
+      catch(e){if(e.status===404){S.settings.gistId="";id=null;}else throw e;}}
+    if(!id){const g=await this.req("/gists",{method:"POST",body:JSON.stringify({description:this.DESC,public:false,files:{[this.FILE]:{content}}})});S.settings.gistId=g.id;}
+    S.settings.lastBackup=new Date().toISOString();R.flags.cloudNewer=0;R.flags.bkErr="";save();},
+  async restore(){const id=await this.findGist();if(!id)throw new Error("Chưa có bản sao lưu nào trên GitHub.");const d=await this.read(id);
+    if(!d||!d.profile||!Array.isArray(d.sessions))throw new Error("Bản sao lưu không hợp lệ.");
+    const keep={a:S.settings.azureKey,r:S.settings.azureRegion,g:S.settings.geminiKey,t:S.settings.ghToken};
+    localStorage.setItem(KEY,JSON.stringify(d));S=load();
+    Object.assign(S.settings,{azureKey:keep.a,azureRegion:keep.r||S.settings.azureRegion,geminiKey:keep.g,ghToken:keep.t,gistId:id,lastBackup:d.backupAt||new Date().toISOString()});
+    R.flags.cloudNewer=0;save();return d;}
+};
+let bkRunning=false;
+function autoBackup(){if(!Cloud.ok()||bkRunning)return Promise.resolve();bkRunning=true;
+  return Cloud.backup().then(()=>{R.flags.bkErr="";}).catch(e=>{R.flags.bkErr=e.message;console.warn(e);}).finally(()=>{bkRunning=false;if(["home","settings","done","report"].includes(R.view))render();});}
+function fmtTime(iso){if(!iso)return"";const d=new Date(iso);return pad(d.getHours())+":"+pad(d.getMinutes())+" "+pad(d.getDate())+"/"+pad(d.getMonth()+1);}
 
 /* ---------------- Soạn bài học ---------------- */
 function nextTopic(){const st=S.profile.stage,list=TOPICS[st],i=S.profile.lessonIdx[st]||0;return{t:list[i%list.length],variation:Math.floor(i/list.length)};}
@@ -539,7 +574,7 @@ function finishSession(){const c=S.current;if(!c)return;const sc=sessionScores(c
   R.audio={};R.results={};
   const wk=rec.week,cnt=S.sessions.filter(s=>s.week===wk).length;
   if(cnt>=5&&!S.reports[wk]){R.view="bench";R.bench={};R.benchWeek=wk;}else{R.view="done";R.lastSession=rec;}
-  render();window.scrollTo(0,0);}
+  render();window.scrollTo(0,0);autoBackup();}
 
 /* ---------------- Báo cáo tuần ---------------- */
 function weekMetrics(wk){const ss=S.sessions.filter(s=>s.week===wk);if(!ss.length)return null;const k=["pron","fluency","grammar","vocab","listen"];const sk={};
@@ -563,6 +598,7 @@ Weak phonemes are IPA symbols with average accuracy. Corrections are real mistak
 Write a weekly progress report. Return JSON:
 {"status":"good" | "steady" | "slow","headline_vi":"one short sentence verdict","analysis_vi":"3-5 sentences: what improved, what did not, compared with last week if available","wins_vi":["2-3 concrete wins"],"patterns_vi":["2-3 recurring mistakes with the correct form"],"focus_vi":["3 concrete focus points for next week"],"tip_vi":"one practical daily habit tip"}`}],0.5);
     rep.ai=r;S.reports[wk]=rep;save();}catch(e){toast("Chưa viết được nhận xét AI: "+e.message,6000);}
+  autoBackup();
 }
 function maybeBackfillReport(){const cur=weekKey();const past=allWeeks().filter(w=>w<cur&&!S.reports[w]);const last=past.pop();if(last&&!R.flags.backfill){R.flags.backfill=true;buildReport(last,null).then(render);}}
 
@@ -603,6 +639,8 @@ function viewHome(){checkMonth();const st=S.profile.stage,stg=STAGES[st];const w
    `<button class="btn-pri btn-big" data-act="start">${cur?"Tiếp tục buổi học ▶︎":"Bắt đầu buổi học (~50 phút) ▶︎"}</button>
    ${cur?`<button class="btn-ghost small" data-act="discard">Bỏ buổi này, làm bài mới</button>`:`<button class="btn-ghost small" data-act="skiptopic">Đổi sang chủ đề khác</button>`}`}</div></div>
   <div class="row"><button class="grow" data-act="nav" data-v="progress">📈 Tiến độ</button><button class="grow" data-act="nav" data-v="phrases">📚 Cụm từ (${S.phrases.length})</button>${lastRep?`<button class="grow" data-act="report" data-w="${lastRep}">📝 Báo cáo</button>`:""}</div>
+  ${Cloud.ok()?`<div class="small ${R.flags.bkErr?"c-b":"mute"}" style="margin:6px 2px">${R.flags.bkErr?"⚠️ Sao lưu lỗi: "+esc(R.flags.bkErr):"☁️ Đã sao lưu tự động lên GitHub"+(S.settings.lastBackup?" lúc "+fmtTime(S.settings.lastBackup):"")}</div>`:
+   `<div class="fixbox small">☁️ Chưa bật <b>sao lưu tự động</b>. Đổi máy hoặc xoá Safari là mất tiến độ. <a href="#" data-act="nav" data-v="settings">Bật ngay</a></div>`}
   <div class="card"><div class="row between small"><span>🎙 Chấm phát âm miễn phí còn lại tháng này</span><b>${azLeft} phút</b></div><div class="meter" style="margin-top:6px"><i style="width:${pct}%"></i></div>
    <p class="small mute">Azure gói Free: 5 giờ/tháng, hết thì tạm dừng chấm âm, KHÔNG tính tiền.</p></div>`;}
 
@@ -618,7 +656,13 @@ function viewSettings(){const s=S.settings;return `<div class="row"><button clas
   <label>Giai đoạn học hiện tại</label><select id="optStage">${[1,2,3].map(i=>`<option value="${i}" ${S.profile.stage===i?"selected":""}>${i} · ${STAGES[i].name}</option>`).join("")}</select>
   <p class="small mute">Model Gemini: ${esc((s.liteModels||[]).concat(s.flashModels||[]).join(", ")||"chưa chọn")}</p>
   <div class="row"><button data-act="saveopts">Lưu tuỳ chọn</button><button data-act="repick">Dò lại model Gemini</button></div></div>
- <div class="card"><h3>💾 Sao lưu dữ liệu</h3><p class="small mute">Thỉnh thoảng hãy sao lưu (không gồm key) và dán vào Ghi chú để không mất tiến độ.</p>
+ <div class="card"><h3>☁️ Sao lưu tự động (GitHub)</h3>
+  <p class="small mute">Tiến độ được tự lưu lên một Gist <b>bí mật</b> trong tài khoản GitHub của bạn sau mỗi buổi học và mỗi báo cáo tuần (không gồm key). Đổi máy chỉ cần nhập lại token rồi bấm Khôi phục.</p>
+  <details><summary>Cách tạo GitHub token (2 phút)</summary><ol class="small"><li>Mở <b>github.com</b> → ảnh đại diện → <b>Settings</b> → <b>Developer settings</b>.</li><li><b>Personal access tokens → Tokens (classic)</b> → <b>Generate new token (classic)</b>.</li><li>Note: <code>SpeakHR</code> · Expiration: <b>No expiration</b> · chỉ tick ô <b>gist</b>.</li><li>Bấm <b>Generate token</b>, copy mã bắt đầu bằng <code>ghp_</code> và dán vào dưới.</li></ol></details>
+  <label>GitHub token (quyền gist)</label><input id="ghTok" type="password" autocomplete="off" value="${esc(s.ghToken||"")}" placeholder="ghp_...">
+  <div class="row" style="margin-top:10px"><button class="btn-pri" data-act="bknow">Lưu & sao lưu ngay</button><button data-act="cloudrestore">Khôi phục từ GitHub</button></div>
+  <p class="small ${R.flags.bkErr?"c-b":"mute"}" id="bkOut">${R.flags.bkErr?"⚠️ "+esc(R.flags.bkErr):s.lastBackup?"✅ Sao lưu gần nhất: "+fmtTime(s.lastBackup):""}</p></div>
+ <div class="card"><h3>💾 Sao lưu thủ công</h3><p class="small mute">Dự phòng thêm: copy dữ liệu (không gồm key) dán vào Ghi chú.</p>
   <div class="row"><button data-act="export">Sao lưu</button><button data-act="import">Khôi phục</button><button class="btn-danger" data-act="reset">Xoá hết</button></div></div>`;}
 
 function viewGuide(){return `<div class="row"><button class="btn-ghost" data-act="nav" data-v="${S.settings.geminiKey?"settings":"home"}">← Về</button><h2 class="grow">Lấy key miễn phí</h2></div>
@@ -771,13 +815,18 @@ document.addEventListener("click",async e=>{const el=e.target.closest("[data-act
   else if(a==="testkeys")testKeys();
   else if(a==="saveopts"){S.settings.convoPron=$("#optConvo").checked;S.settings.prosody=$("#optPros").checked;const ns=Number($("#optStage").value);if(ns!==S.profile.stage){S.profile.stage=ns;S.profile.stageSince=weekKey();}save();toast("Đã lưu ✓");render();}
   else if(a==="repick"){S.settings.liteModels=[];S.settings.flashModels=[];R.blocked={};await Gem.pick(true);toast("Đã chọn: "+S.settings.liteModels.concat(S.settings.flashModels).join(", "),6000);render();}
-  else if(a==="export"){const d=JSON.parse(JSON.stringify(S));d.settings.azureKey="";d.settings.geminiKey="";const txt=JSON.stringify(d);
+  else if(a==="export"){const d=JSON.parse(JSON.stringify(S));d.settings.azureKey="";d.settings.geminiKey="";d.settings.ghToken="";const txt=JSON.stringify(d);
     showModal(`<h3>Sao lưu</h3><p class="small">Bấm Copy rồi dán vào app Ghi chú (Notes) để cất giữ.</p><textarea id="bk" rows="6">${esc(txt)}</textarea><div class="row" style="margin-top:8px"><button class="btn-pri" data-act="copybk">Copy</button><button data-act="close">Đóng</button></div>`);}
   else if(a==="copybk"){const t=$("#bk").value;try{await navigator.clipboard.writeText(t);toast("Đã copy ✓");}catch(err){$("#bk").select();toast("Hãy chọn tất cả và copy thủ công.");}}
   else if(a==="import"){showModal(`<h3>Khôi phục</h3><p class="small">Dán nội dung sao lưu vào đây. Dữ liệu hiện tại sẽ bị thay thế (giữ lại key).</p><textarea id="bk" rows="6"></textarea><div class="row" style="margin-top:8px"><button class="btn-pri" data-act="doimport">Khôi phục</button><button data-act="close">Đóng</button></div>`);}
-  else if(a==="doimport"){try{const d=JSON.parse($("#bk").value);if(!d||!d.profile||!Array.isArray(d.sessions))throw 0;const keys={a:S.settings.azureKey,r:S.settings.azureRegion,g:S.settings.geminiKey};localStorage.setItem(KEY,JSON.stringify(d));S=load();S.settings.azureKey=keys.a;S.settings.azureRegion=keys.r||S.settings.azureRegion;S.settings.geminiKey=keys.g;save();closeModal();toast("Đã khôi phục ✓");R.view="home";render();}catch(err){toast("Dữ liệu sao lưu không hợp lệ.");}}
+  else if(a==="doimport"){try{const d=JSON.parse($("#bk").value);if(!d||!d.profile||!Array.isArray(d.sessions))throw 0;const keys={a:S.settings.azureKey,r:S.settings.azureRegion,g:S.settings.geminiKey,t:S.settings.ghToken,id:S.settings.gistId};localStorage.setItem(KEY,JSON.stringify(d));S=load();S.settings.ghToken=keys.t||"";S.settings.gistId=keys.id||"";S.settings.lastBackup="";S.settings.azureKey=keys.a;S.settings.azureRegion=keys.r||S.settings.azureRegion;S.settings.geminiKey=keys.g;save();closeModal();toast("Đã khôi phục ✓");R.view="home";render();}catch(err){toast("Dữ liệu sao lưu không hợp lệ.");}}
   else if(a==="reset"){showModal(`<h3>Xoá toàn bộ dữ liệu?</h3><p>Mọi buổi học, cụm từ, báo cáo sẽ mất. Không hoàn tác được.</p><div class="row"><button class="btn-danger" data-act="doreset">Xoá hết</button><button data-act="close">Huỷ</button></div>`);}
-  else if(a==="doreset"){const k={a:S.settings.azureKey,r:S.settings.azureRegion,g:S.settings.geminiKey};S=defaults();S.settings.azureKey=k.a;S.settings.azureRegion=k.r;S.settings.geminiKey=k.g;save();closeModal();R.view="home";render();}
+  else if(a==="doreset"){const k={a:S.settings.azureKey,r:S.settings.azureRegion,g:S.settings.geminiKey,t:S.settings.ghToken};S=defaults();S.settings.ghToken=k.t;S.settings.azureKey=k.a;S.settings.azureRegion=k.r;S.settings.geminiKey=k.g;save();closeModal();R.view="home";render();}
+  else if(a==="bknow"){const t=$("#ghTok").value.trim();if(t!==S.settings.ghToken){S.settings.ghToken=t;S.settings.gistId="";S.settings.lastBackup="";}save();
+    if(!t){toast("Hãy dán GitHub token trước.");return;}$("#bkOut").innerHTML='<span class="spin"></span> Đang sao lưu...';await autoBackup();toast(R.flags.bkErr?R.flags.bkErr:"Đã sao lưu lên GitHub ✓",5000);}
+  else if(a==="cloudrestore"){const t=$("#ghTok").value.trim();if(t!==S.settings.ghToken){S.settings.ghToken=t;S.settings.gistId="";S.settings.lastBackup="";save();}if(!t){toast("Hãy dán GitHub token trước.");return;}
+    showModal(`<h3>Khôi phục từ GitHub?</h3><p>Dữ liệu học trên máy này sẽ được thay bằng bản sao lưu trên GitHub (key vẫn giữ nguyên).</p><div class="row"><button class="btn-pri" data-act="docloudrestore">Khôi phục</button><button data-act="close">Huỷ</button></div>`);}
+  else if(a==="docloudrestore"){closeModal();toast("Đang khôi phục...");const d=await Cloud.restore();R.flags.bkErr="";toast("Đã khôi phục "+d.sessions.length+" buổi học ✓",5000);R.view="home";render();}
   else if(a==="close")closeModal();
   }catch(err){console.error(err);toast(err.message||String(err),6000);}
 });
@@ -813,6 +862,7 @@ async function testKeys(){const out=$("#testOut");const azKey=$("#azKey").value.
 
 /* ---------------- Khởi động ---------------- */
 checkMonth();render();maybeBackfillReport();
+if(Cloud.ok()&&(!S.settings.lastBackup||Date.now()-new Date(S.settings.lastBackup).getTime()>12*3600e3))autoBackup();
 document.addEventListener("visibilitychange",()=>{if(document.hidden&&Rec.active){Rec.stop();R.recCtx=null;render();}});
 </script>
 </body>

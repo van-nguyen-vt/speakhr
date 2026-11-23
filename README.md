@@ -24,3 +24,7 @@ Web app cá nhân để luyện nói, phát âm (chấm từng âm kiểu ELSA),
 7. Tổng kết điểm
 
 Sau buổi thứ 5 trong tuần: bài kiểm tra đọc cố định + báo cáo tuần.
+
+## Sao lưu tự động
+
+Trong ⚙️ Cài đặt, dán GitHub token (classic, chỉ quyền **gist**). App tự lưu tiến độ lên một Gist bí mật sau mỗi buổi học và mỗi báo cáo tuần. Đổi máy: nhập lại token → **Khôi phục từ GitHub**. Bản sao lưu không chứa key.
